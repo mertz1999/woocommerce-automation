@@ -2,29 +2,25 @@
 #woocomerce_extension main class 
 from woocommerce import API
 import sqlite3
-import json , torch
-import numpy as np
-from datetime import datetime
-from langchain.utilities import SQLDatabase
+import json 
 from langchain_experimental.sql import SQLDatabaseChain
-from langchain.chat_models import ChatOpenAI
-from langchain.tools import Tool
+from langchain_community.llms import openai
+from langchain_community.tools import Tool
 from langchain.agents import initialize_agent, AgentType
-from langchain.llms import OpenAI
-from transformers import AutoProcessor, LlavaForConditionalGeneration
-from sentence_transformers import SentenceTransformer # type: ignore
-from PIL import Image
 import threading
 from queue import Queue
-import openai 
 import time
 import requests
-from io import BytesIO
+from langchain_community.utilities import SQLDatabase
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_community.chat_models import ChatOpenAI # Import ChatOpenAI from langchain_community
 from langchain_core.tools import tool
 from langchain_community.embeddings import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.messages import HumanMessage
 
 class woocomerce_ext(API):
     def __init__(self, httpsurl, wckey, wcsecret, db_path="woocomerce.db" ):
@@ -74,7 +70,8 @@ class woocomerce_ext(API):
             self.all_products.extend(products)
             page += 1
 
-        return self.all_products 
+        #return self.all_products 
+        print("fetching compelete")
     
     def put_db_products(self): # import important data to database
       
@@ -83,21 +80,29 @@ class woocomerce_ext(API):
        name = p["name"]
        description = p["description"]
        price = p["price"]
-       regular_price =p["regual_price"] if "regular_price" in p else ""
-       sale_price = p["sale_price"] if "sale_price" in p else ""
-       on_sale = p["on_sale"]
-       total_sale = p["total_sale"] if "total_sale" in p else ""
-       stock_quantity= p[stock_quantity] if "stock_quantity" in p else ""
-       stock = p["stock_status"]
-       category = p["categories"][0]["name"] if p["categories"] else "بدون دسته"
-       image_url = p["images"][0]["src"] if p["images"] else ""
+      # regular_price =p["regular_price"] if "regular_price" in p else ""
+      # sale_price = p["sale_price"] if "sale_price" in p else ""
+     #  on_sale = p["on_sale"]
+      # total_sale = p["total_sale"] if "total_sale" in p else ""
+       #stock_quantity= p[stock_quantity] if "stock_quantity" in p else ""
+      # stock = p["stock_status"]
+     #  category = p["categories"][0]["name"] if p["categories"] else "بدون دسته"
+      # image_url = p["images"][0]["src"] if p["images"] else ""
+
+      # self.cursor.execute("""
+       #    INSERT OR REPLACE INTO products (id, name,description, price,regular_price, sale_price,on_sale,total_sale, stock_quantity, stock_status, category, image_url)
+       #    VALUES (?, ?, ?, ?, ?, ?)
+        #   """, (product_id, name, description ,price , regular_price, sale_price ,on_sale, total_sale, stock_quantity, stock, category, image_url))
+
 
        self.cursor.execute("""
-           INSERT OR REPLACE INTO products (id, name,description, price,regular_price, sale_price,on_sale,total_sale, stock_quantity, stock_status, category, image_url)
-           VALUES (?, ?, ?, ?, ?, ?)
-           """, (product_id, name, description ,price , regular_price, sale_price ,on_sale, total_sale, stock_quantity, stock, category, image_url))
+           INSERT OR REPLACE INTO products (id, name,description, price)
+           VALUES (?, ?, ?, ?)
+           """, (product_id, name, description ,price ))
+
 
       self.conn.commit()
+      print("data inserted to database")
 
     def generate_variation_text(self):
        
@@ -111,9 +116,9 @@ class woocomerce_ext(API):
 
           
         llm = ChatOpenAI(
-        base_url="https://openrouter.ai/api/v1",
-        api_key=OPENROUTER_API_KEY,
-        model=MODEL_NAME,  # یا هر مدل دیگر مانند meta-llama/...
+         model_name=MODEL_NAME,
+         openai_api_base="https://openrouter.ai/api/v1",
+         openai_api_key=OPENROUTER_API_KEY,
         )
 
         # قالب پرامپت برای تولید نسخه‌های متفاوت از توضیح محصول
@@ -129,6 +134,7 @@ class woocomerce_ext(API):
         def generate_variations( description, n=2):
           try:
            output = chain.invoke({"description": description, "n": n})
+           print(output)
            return output
           except Exception as e:
            raise Exception(f"LangChain Error: {str(e)}")
@@ -293,10 +299,11 @@ class woocomerce_ext(API):
 
 # نمونه استفاده
 if __name__ == "__main__":
-    processor = woocomerce_ext()
+    processor = woocomerce_ext(
 
-    processor.process_product(
-        title="کفش اسپرت مردانه",
-        description="مناسب برای پیاده‌روی‌های طولانی، بسیار راحت و سبک.",
-        image_url="https://example.com/images/shoe1.jpg"
-    )
+"https://motiongraphistan.com", "ck_2425836dfb4a29fda20f49981a350bd1d3237042", "cs_285c3d6d0704e85cb53972996d64a5e5fadb4970", db_path="woocomerce.db" )
+
+   # processor.fetch_site_data()
+  #  processor.put_db_products()
+    processor.generate_variation_text()
+      
