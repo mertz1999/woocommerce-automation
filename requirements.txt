@@ -1,0 +1,7 @@
+woocommerce
+requests
+openai
+langchain
+langchain-core
+langchain-community
+langchain-openai
