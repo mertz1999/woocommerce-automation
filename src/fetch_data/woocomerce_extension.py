@@ -1,4 +1,6 @@
-
+import logging
+import os
+from dotenv import load_dotenv
 #woocomerce_extension main class 
 from woocommerce import API
 import sqlite3
@@ -22,8 +24,24 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import HumanMessage
 
+# Set up logger
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+# Load environment variables from .env file
+load_dotenv()
+
 class woocomerce_ext(API):
-    def __init__(self, httpsurl, wckey, wcsecret, db_path="woocomerce.db" ):
+    def __init__(self, httpsurl=None, wckey=None, wcsecret=None, db_path=None ):
+        # Load from environment if not provided
+        httpsurl = httpsurl or os.getenv("WC_URL")
+        wckey = wckey or os.getenv("WC_KEY")
+        wcsecret = wcsecret or os.getenv("WC_SECRET")
+        db_path = db_path or os.getenv("DB_PATH", "woocomerce.db")
         super().__init__(
             url=httpsurl,
             consumer_key=wckey,
@@ -39,7 +57,7 @@ class woocomerce_ext(API):
     def _create_table(self):
         self.cursor.execute("""
         CREATE TABLE IF NOT EXISTS products (
-             id INTEGER PRIMARY KEY,
+           id INTEGER PRIMARY KEY,
            name TEXT,
            description TEXT,
            variations TEXT,
@@ -55,7 +73,7 @@ class woocomerce_ext(API):
         
         self.conn.commit()
 
-    def fetch_site_data(self):  #getting all products data from site(name- description- image- price -...)
+    def fetch_site_data(self):  # getting all products data from site (name, description, image, price, ...)
         
         self.all_products = []
         page = 1
@@ -71,7 +89,7 @@ class woocomerce_ext(API):
             page += 1
 
         #return self.all_products 
-        print("fetching compelete")
+        logger.info("Fetching complete")
     
     def put_db_products(self): # import important data to database
       
@@ -102,17 +120,16 @@ class woocomerce_ext(API):
 
 
       self.conn.commit()
-      print("data inserted to database")
+      logger.info("Data inserted to database")
 
     def generate_variation_text(self):
        
         # SET API KEY
-        OPENROUTER_API_KEY = "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"
-        MODEL_NAME = "meta-llama/llama-3.1-8b-instruct:free"
-
-        #  تنظیمات کلی
-        MAX_WORKERS = 5  # تعداد تردهای همزمان
-        SLEEP_TIME = 1.5  # زمان مکث بین درخواست‌ها
+        OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+        MODEL_NAME = os.getenv("MODEL_NAME")
+        # General settings
+        MAX_WORKERS = 5  # Number of concurrent threads
+        SLEEP_TIME = 1.5  # Sleep time between requests
 
           
         llm = ChatOpenAI(
@@ -121,25 +138,26 @@ class woocomerce_ext(API):
          openai_api_key=OPENROUTER_API_KEY,
         )
 
-        # قالب پرامپت برای تولید نسخه‌های متفاوت از توضیح محصول
+        # Prompt template for generating different versions of product descriptions
         prompt = PromptTemplate.from_template(
-            """این یک توضیح محصول است:
+            """This is a product description:
                         "{description}"
-                            لطفاً {n} نسخه متفاوت و ترغیب‌کننده از این متن برای فروشگاه اینترنتی بنویس. لحنت باید دوستانه و قانع‌کننده باشد."""
+                            Please write {n} different and persuasive versions of this text for an online store. The tone should be friendly and convincing."""
                         )
 
-        # خروجی را به شکل متن ساده دریافت می‌کنیم
+        # Output as plain text
         chain = prompt | llm | StrOutputParser()
 
         def generate_variations( description, n=2):
           try:
            output = chain.invoke({"description": description, "n": n})
-           print(output)
+           logger.info(f"Generated variations for description: {description[:30]}...")
            return output
           except Exception as e:
-           raise Exception(f"LangChain Error: {str(e)}")
+           logger.error(f"LangChain Error: {str(e)}")
+           raise
 
-          # FUNCTION TO EXECUTE PER PRODUCT IN THREAD
+        # FUNCTION TO EXECUTE PER PRODUCT IN THREAD
         def process_product(product_id, description):
            try:
              variations = generate_variations( description)
@@ -150,13 +168,13 @@ class woocomerce_ext(API):
               )
              self.conn.commit()
              self.conn.close()
-             print(f"✅ ذخیره شد: محصول {product_id}")
+             logger.info(f"Saved: Product {product_id}")
              time.sleep(SLEEP_TIME)
 
            except Exception as e:
-             print(f"❌ خطا برای محصول {product_id}: {str(e)}")
+             logger.error(f"Error for product {product_id}: {str(e)}")
 
-         #  سیستم صف برای مدیریت چندتردی
+        # Queue system for multithreading management
         def worker():
          while True:
            item = q.get()
@@ -166,13 +184,12 @@ class woocomerce_ext(API):
            process_product(product_id, description)
            q.task_done()
 
-    #  خواندن محصولات از دیتابیس
-    
+         # Read products from database
          self.cursor.execute("SELECT id, description FROM products")
          products = self.cursor.fetchall()
          self.conn.close()
 
-        #  ایجاد تردها و صف
+        # Create threads and queue
          q = Queue()
          threads = []
 
@@ -181,20 +198,20 @@ class woocomerce_ext(API):
           t.start()
           threads.append(t)
 
-#  افزودن کارها به صف
+        # Add tasks to queue
          for product in products:
           q.put(product)
 
-#  منتظر بمان تا همه کارها تمام شوند
+        # Wait for all tasks to finish
          q.join()
 
-#  بستن تردها
+        # Close threads
          for i in range(MAX_WORKERS):
            q.put(None)
            for t in threads:
              t.join()
 
-         print("\n🎉 تمام محصولات پردازش شدند.")
+         logger.info("All products processed.")
 
 
    
@@ -203,13 +220,13 @@ class woocomerce_ext(API):
     def compute_embedding(self):
 
 
-        #  تنظیمات اولیه
-        OPENROUTER_API_KEY = "YOUR_OPENROUTER_API_KEY"
-        MODEL_NAME = "openai/text-embedding-ada-002"
+        # Initial settings
+        OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+        MODEL_NAME = os.getenv("EMBEDDING_MODEL")
         NUM_THREADS = 4
 
        
-        #  آماده‌سازی جدول خروجی
+        # Prepare output table
         def setup_output_table():
             
             self.cursor.execute("""
@@ -227,7 +244,7 @@ class woocomerce_ext(API):
         # define agent tool
         @tool
         def embed_and_store(id: int, description: str, variations: str) -> str:
-            """تولید embedding برای متن و ذخیره آن در دیتابیس."""
+            """Generate embedding for text and store it in the database."""
             try:
                 embedder = OpenAIEmbeddings(
                     model=MODEL_NAME,
@@ -242,11 +259,13 @@ class woocomerce_ext(API):
                         (id, json.dumps(vector_des), json.dumps(vector_var)))
                 self.conn.commit()
                 self.conn.close()
-                return f"✅ ذخیره شد: id={id} "
+                logger.info(f"Saved embedding: id={id}")
+                return f"Saved: id={id} "
             except Exception as e:
-                return f"❌ خطا: {str(e)}"
+                logger.error(f"Embedding error: {str(e)}")
+                return f"Error: {str(e)}"
 
-        #  سیستم Thread و Queue
+        # Thread and Queue system
         q = Queue()
 
         def worker(agent):
@@ -255,18 +274,18 @@ class woocomerce_ext(API):
                 if item is None:
                     break
                 row_id, des, var = item
-                agent.invoke({"input": f"ذخیره embedding  برای متن اول و دوم:\n{des}\n{var}", "id": row_id, "description": "des", "variations": var})
+                agent.invoke({"input": f"Save embedding for text1 and text2:\n{des}\n{var}", "id": row_id, "description": "des", "variations": var})
                
                 q.task_done()
                 time.sleep(1)
 
-        # 📋 خواندن داده‌ها
+        # Read data
         
         self.cursor.execute("SELECT id, text1, text2 FROM text_data")
         rows = self.cursor.fetchall()
         self.conn.close()
 
-        # 🧠 Agent را بساز
+        # Build the agent
         tools = [embed_and_store]
         agent = initialize_agent(
             tools=tools,
@@ -274,36 +293,33 @@ class woocomerce_ext(API):
             verbose=True
         )
 
-        # 🧵 راه‌اندازی تردها
+        # Start threads
         threads = []
         for _ in range(NUM_THREADS):
             t = threading.Thread(target=worker, args=(agent,))
             t.start()
             threads.append(t)
 
-        # ➕ پر کردن صف
+        # Fill the queue
         for row in rows:
             q.put(row)
 
         q.join()
 
-        # 🛑 بستن تردها
+        # Stop threads
         for _ in range(NUM_THREADS):
             q.put(None)
         for t in threads:
             t.join()
 
-        print("\n🎉 همه embedding ها انجام و ذخیره شدند.")
+        logger.info("All embeddings processed and saved.")
 
    
 
-# نمونه استفاده
+# Example usage
 if __name__ == "__main__":
-    processor = woocomerce_ext(
-
-"https://motiongraphistan.com", "ck_2425836dfb4a29fda20f49981a350bd1d3237042", "cs_285c3d6d0704e85cb53972996d64a5e5fadb4970", db_path="woocomerce.db" )
-
-   # processor.fetch_site_data()
-  #  processor.put_db_products()
-    processor.generate_variation_text()
+    processor = woocomerce_ext()
+    processor.fetch_site_data()
+    processor.put_db_products()
+    # processor.generate_variation_text()
       

@@ -5,3 +5,5 @@ langchain
 langchain-core
 langchain-community
 langchain-openai
+langchain_experimental
+python-dotenv
