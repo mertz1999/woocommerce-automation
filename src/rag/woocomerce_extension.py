@@ -82,7 +82,7 @@ class woocomerce_ext(API):
             response = self.get("products", params={"per_page": 100, "page": page})
             products = response.json()
 
-            if not products:  # وقتی دیگه محصولی برنگشت
+            if not products:
                 break
 
             self.all_products.extend(products)
@@ -123,15 +123,15 @@ class woocomerce_ext(API):
       logger.info("Data inserted to database")
 
     def generate_variation_text(self):
-       
         # SET API KEY
         OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
         MODEL_NAME = os.getenv("MODEL_NAME")
-        # General settings
-        MAX_WORKERS = 5  # Number of concurrent threads
         SLEEP_TIME = 1.5  # Sleep time between requests
 
-          
+        logger.info(f"OPENROUTER_API_KEY: {OPENROUTER_API_KEY}")
+        logger.info(f"MODEL_NAME: {MODEL_NAME}")
+        logger.info(f"SLEEP_TIME: {SLEEP_TIME}")
+
         llm = ChatOpenAI(
          model_name=MODEL_NAME,
          openai_api_base="https://openrouter.ai/api/v1",
@@ -148,87 +148,41 @@ class woocomerce_ext(API):
         # Output as plain text
         chain = prompt | llm | StrOutputParser()
 
-        def generate_variations( description, n=2):
-          try:
-           output = chain.invoke({"description": description, "n": n})
-           logger.info(f"Generated variations for description: {description[:30]}...")
-           return output
-          except Exception as e:
-           logger.error(f"LangChain Error: {str(e)}")
-           raise
+        def generate_variations(description, n=2):
+            try:
+                output = chain.invoke({"description": description, "n": n})
+                logger.info(f"Generated variations for description: {description[:30]}...")
+                return output
+            except Exception as e:
+                logger.error(f"LangChain Error: {str(e)}")
+                raise
 
-        # FUNCTION TO EXECUTE PER PRODUCT IN THREAD
-        def process_product(product_id, description):
-           try:
-             variations = generate_variations( description)
-             
-             self.cursor.execute(
-              "INSERT INTO products (product_id, variation_text) VALUES (?, ?)",
-               (product_id, variations)
-              )
-             self.conn.commit()
-             self.conn.close()
-             logger.info(f"Saved: Product {product_id}")
-             time.sleep(SLEEP_TIME)
+        # Read products from database
+        self.cursor.execute("SELECT id, description FROM products")
+        products = self.cursor.fetchall()
 
-           except Exception as e:
-             logger.error(f"Error for product {product_id}: {str(e)}")
+        for product_id, description in products:
+            try:
+                variations = generate_variations(description)
+                self.cursor.execute(
+                    "INSERT INTO products (product_id, variation_text) VALUES (?, ?)",
+                    (product_id, variations)
+                )
+                self.conn.commit()
+                logger.info(f"Saved: Product {product_id}")
+                time.sleep(SLEEP_TIME)
+            except Exception as e:
+                logger.error(f"Error for product {product_id}: {str(e)}")
 
-        # Queue system for multithreading management
-        def worker():
-         while True:
-           item = q.get()
-           if item is None:
-             break
-           product_id, description = item
-           process_product(product_id, description)
-           q.task_done()
-
-         # Read products from database
-         self.cursor.execute("SELECT id, description FROM products")
-         products = self.cursor.fetchall()
-         self.conn.close()
-
-        # Create threads and queue
-         q = Queue()
-         threads = []
-
-         for i in range(MAX_WORKERS):
-          t = threading.Thread(target=worker)
-          t.start()
-          threads.append(t)
-
-        # Add tasks to queue
-         for product in products:
-          q.put(product)
-
-        # Wait for all tasks to finish
-         q.join()
-
-        # Close threads
-         for i in range(MAX_WORKERS):
-           q.put(None)
-           for t in threads:
-             t.join()
-
-         logger.info("All products processed.")
-
-
-   
-
+        logger.info("All products processed.")
 
     def compute_embedding(self):
-
-
         # Initial settings
         OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
         MODEL_NAME = os.getenv("EMBEDDING_MODEL")
-        NUM_THREADS = 4
 
-       
         # Prepare output table
         def setup_output_table():
-            
             self.cursor.execute("""
                 CREATE TABLE IF NOT EXISTS text_embeddings (
                     id INTEGER,
@@ -237,7 +191,6 @@ class woocomerce_ext(API):
                 )
             """)
             self.conn.commit()
-            self.conn.close()
 
         setup_output_table()
 
@@ -254,36 +207,19 @@ class woocomerce_ext(API):
 
                 vector_des = embedder.embed_query(description)
                 vector_var = embedder.embed_query(variations)
-               
+
                 self.cursor.execute("INSERT INTO text_embeddings (id, description, embedding) VALUES (?, ?, ?)",
                         (id, json.dumps(vector_des), json.dumps(vector_var)))
                 self.conn.commit()
-                self.conn.close()
                 logger.info(f"Saved embedding: id={id}")
                 return f"Saved: id={id} "
             except Exception as e:
                 logger.error(f"Embedding error: {str(e)}")
                 return f"Error: {str(e)}"
 
-        # Thread and Queue system
-        q = Queue()
-
-        def worker(agent):
-            while True:
-                item = q.get()
-                if item is None:
-                    break
-                row_id, des, var = item
-                agent.invoke({"input": f"Save embedding for text1 and text2:\n{des}\n{var}", "id": row_id, "description": "des", "variations": var})
-               
-                q.task_done()
-                time.sleep(1)
-
         # Read data
-        
         self.cursor.execute("SELECT id, text1, text2 FROM text_data")
         rows = self.cursor.fetchall()
-        self.conn.close()
 
         # Build the agent
         tools = [embed_and_store]
@@ -293,33 +229,17 @@ class woocomerce_ext(API):
             verbose=True
         )
 
-        # Start threads
-        threads = []
-        for _ in range(NUM_THREADS):
-            t = threading.Thread(target=worker, args=(agent,))
-            t.start()
-            threads.append(t)
-
-        # Fill the queue
         for row in rows:
-            q.put(row)
-
-        q.join()
-
-        # Stop threads
-        for _ in range(NUM_THREADS):
-            q.put(None)
-        for t in threads:
-            t.join()
+            row_id, des, var = row
+            agent.invoke({"input": f"Save embedding for text1 and text2:\n{des}\n{var}", "id": row_id, "description": des, "variations": var})
+            time.sleep(1)
 
         logger.info("All embeddings processed and saved.")
-
-   
 
 # Example usage
 if __name__ == "__main__":
     processor = woocomerce_ext()
-    processor.fetch_site_data()
-    processor.put_db_products()
-    # processor.generate_variation_text()
+    # processor.fetch_site_data()
+    # processor.put_db_products()
+    processor.generate_variation_text()
       
