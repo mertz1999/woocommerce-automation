@@ -19,6 +19,7 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.messages import HumanMessage
 import psycopg2
+import concurrent.futures
 
 # Set up logger
 logger = logging.getLogger(__name__)
@@ -118,45 +119,55 @@ class woocomerce_ext(API):
         OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
         MODEL_NAME = os.getenv("MODEL_NAME")
         SLEEP_TIME = 1.5
+        MAX_WORKERS = 3  # Adjusted for your LLM rate limits
         llm = ChatOpenAI(
             model_name=MODEL_NAME,
             openai_api_base="https://openrouter.ai/api/v1",
             openai_api_key=OPENROUTER_API_KEY,
         )
         prompt = PromptTemplate.from_template(
-            """This is a product description:
+            """این توضیحات محصول است:
                         "{description}"
-                            Please write {n} different and persuasive versions of this text for an online store. The tone should be friendly and convincing."""
+                            لطفا {n} نسخه متفاوت و متقاعدکننده از این متن را برای فروشگاه آنلاین بنویسید. لحن باید دوستانه و متقاعدکننده باشد."""
         )
         chain = prompt | llm | StrOutputParser()
-        def generate_variations(description, n=2):
+
+        def generate_variations_for_product(product):
+            product_id, description = product
             try:
-                output = chain.invoke({"description": description, "n": n})
+                variations = chain.invoke({"description": description, "n": 2})
                 logger.info(f"Generated variations for description: {description[:30]}...")
-                return output
+                time.sleep(5)  # Sleep 5 seconds between LLM calls
+                return (variations, product_id)
             except Exception as e:
-                logger.error(f"LangChain Error: {str(e)}")
-                raise
+                logger.error(f"Error for product {product_id}: {str(e)}")
+                return (None, product_id)
+
+        # Fetch all products first
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT id, description FROM products")
             products = cursor.fetchall()
             cursor.close()
-        for product_id, description in products:
-            try:
-                variations = generate_variations(description)
-                with self._get_conn() as conn:
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "UPDATE products SET variations = %s WHERE id = %s",
-                        (variations, product_id)
-                    )
-                    conn.commit()
-                    cursor.close()
-                logger.info(f"Saved: Product {product_id}")
-                time.sleep(SLEEP_TIME)
-            except Exception as e:
-                logger.error(f"Error for product {product_id}: {str(e)}")
+
+        # Parallelize LLM calls
+        updates = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_product = {executor.submit(generate_variations_for_product, product): product for product in products}
+            for future in concurrent.futures.as_completed(future_to_product):
+                variations, product_id = future.result()
+                if variations is not None:
+                    updates.append((variations, product_id))
+
+        # Do all DB updates in one connection
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.executemany(
+                "UPDATE products SET variations = %s WHERE id = %s",
+                updates
+            )
+            conn.commit()
+            cursor.close()
         logger.info("All products processed.")
 
     def compute_embedding(self):
@@ -203,7 +214,7 @@ class woocomerce_ext(API):
 # Example usage
 if __name__ == "__main__":
     processor = woocomerce_ext()
-    processor.fetch_site_data()
-    processor.put_db_products()
-    # processor.generate_variation_text()
+    # processor.fetch_site_data()
+    # processor.put_db_products()
+    processor.generate_variation_text()
       
