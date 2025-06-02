@@ -8,3 +8,8 @@ langchain-openai
 langchain_experimental
 python-dotenv
 psycopg2-binary
+concurrent.futures
+html
+re
+time
+os
