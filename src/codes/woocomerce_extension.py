@@ -67,23 +67,23 @@ class woocomerce_ext(API):
                    total_sale TEXT,
                    stock_quantity INTEGER,
                    category TEXT,
-                   image_url TEXT
+                   image_url TEXT,
                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS product_descriptions (
                     id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                    product_id INT FOREIGN KEY REFERENCES products(id) NOT NULL,
-                    variation TEXT
+                    product_id INT NOT NULL REFERENCES products(id),
+                    variation TEXT,
                     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS product_embeddings (
                     id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                    variation_id INT FOREIGN KEY REFERENCES product_descriptions(id) NOT NULL,
-                    embedding vector(256)
+                    variation_id INT NOT NULL REFERENCES product_descriptions(id) ,
+                    embedding vector(256),
                     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -342,4 +342,5 @@ if __name__ == "__main__":
     processor.put_db_products()
     processor.generate_variation_text()
     processor.compute_embedding(5) # 5 is the size of batch
+    processor.search_products_by_text("فیلم برداری حرفه ای")
       
