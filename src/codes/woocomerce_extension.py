@@ -17,6 +17,8 @@ from langchain_core.output_parsers import StrOutputParser
 import psycopg2
 import concurrent.futures
 import yaml
+import json
+from tqdm import tqdm
 
 # Set up logger
 logger = logging.getLogger(__name__)
@@ -57,20 +59,17 @@ class woocomerce_ext(API):
     def _create_table(self):
         with self._get_conn() as conn:
             cursor = conn.cursor()
+            # Create new products table with updated structure
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS products (
                    id INTEGER PRIMARY KEY,
                    name TEXT,
                    price TEXT,
-                   regular_price TEXT,
-                   on_sale BOOLEAN,
-                   total_sale TEXT,
-                   stock_quantity INTEGER,
-                   category TEXT,
-                   image_url TEXT,
-                   created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                   meta_data JSONB,
+                   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            # Restore creation of other tables as before
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS product_descriptions (
                     id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -82,7 +81,7 @@ class woocomerce_ext(API):
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS product_embeddings (
                     id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                    variation_id INT NOT NULL REFERENCES product_descriptions(id) ,
+                    variation_id INT NOT NULL REFERENCES product_descriptions(id),
                     embedding vector(256),
                     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -101,47 +100,53 @@ class woocomerce_ext(API):
             self.all_products.extend(products)
             page += 1
         logger.info("Fetching complete")
+        # Save products to product.json
+        with open("product.json", "w", encoding="utf-8") as f:
+            json.dump(self.all_products, f, ensure_ascii=False, indent=2)
     # inserting product information from site to database
-    def put_db_products(self):
+    def put_db_products(self, json_path=None):
+        def clean_text(text):
+            text = re.sub(r'<[^>]+>', '', text)
+            text = html.unescape(text)
+            text = text.replace('\n', ' ').replace('\r', ' ')
+            text = re.sub(r'\s+', ' ', text).strip()
+            return text
 
-      def clean_text(text):
-        text = re.sub(r'<[^>]+>', '', text)
-        text = html.unescape(text)
-        text = text.replace('\n', ' ').replace('\r', ' ')
-        text = re.sub(r'\s+', ' ', text).strip()
-        return text
+        # Load products from JSON if path is provided
+        if json_path is not None:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                products = json.load(f)
+        else:
+            products = self.all_products
 
-      with self._get_conn() as conn:
-        cursor = conn.cursor()
-        for p in self.all_products:
-            product_id = p["id"]
-            name = clean_text(p["name"])
-            description = clean_text(p["description"])
-            price = p["price"]
-            regular_price= p["regular_price"]
-            on_sale=p["on_sale"]
-            stock_quantity=p["stock_quantity"]
-            total_sale = clean_text(p["total_sale"])
-            category=clean_text(p["category"])
-            img_url = clean_text(p["image_url"])
-
-            cursor.execute("""
-                    INSERT INTO products (id, name, price,regular_price,on_sale,total_sale,stock_quantity,
-                           category,image_url)
-                    VALUES (%s, %s, %s,%s, %s,%s, %s, %s, %s)
-                    ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name , price=EXCLUDED.price
-                           , regular_price= EXCLUDED.regular_price , on_sale= EXCLUDED.on_sale, stock_quantity=EXCLUDED.stock_quantity
-                            total_sale = EXCLUDED.total_sale, category=EXCLUDED.category, img_url = EXCLUDED.image_url
-                """, (product_id, name, price,regular_price,on_sale,total_sale,stock_quantity,
-                           category,img_url))
-
-            cursor.execute("""
-                    INSERT INTO product_descriptions (product_id,variation ,created_at)
-                    VALUES (%s, %s, %s)
-                     """, (product_id, description))
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            for p in tqdm(products, desc="Inserting products"):
+                product_id = p["id"]
+                name = clean_text(p["name"])
+                price = p["price"]
+                meta_data = json.dumps(p, ensure_ascii=False)
+                cursor.execute(
+                    """
+                    INSERT INTO products (id, name, price, meta_data)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, price=EXCLUDED.price, meta_data=EXCLUDED.meta_data
+                    """,
+                    (product_id, name, price, meta_data)
+                )
+                # Insert into product_descriptions if description exists
+                if "description" in p:
+                    description = clean_text(p["description"])
+                    cursor.execute(
+                        """
+                        INSERT INTO product_descriptions (product_id, variation)
+                        VALUES (%s, %s)
+                        ON CONFLICT DO NOTHING
+                        """,
+                        (product_id, description)
+                    )
             conn.commit()
             cursor.close()
-           
         logger.info("Data inserted to database")
     # creating variations for product description
     def generate_variation_text(self):
@@ -338,9 +343,9 @@ class woocomerce_ext(API):
 # Example usage
 if __name__ == "__main__":
     processor = woocomerce_ext()
-    processor.fetch_site_data()
-    processor.put_db_products()
+    # processor.fetch_site_data()
+    # processor.put_db_products("./product.json")
     processor.generate_variation_text()
-    processor.compute_embedding(5) # 5 is the size of batch
-    processor.search_products_by_text("فیلم برداری حرفه ای")
+    # processor.compute_embedding(5) # 5 is the size of batch
+    # processor.search_products_by_text("فیلم برداری حرفه ای")
       
