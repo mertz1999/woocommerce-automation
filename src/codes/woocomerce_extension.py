@@ -12,14 +12,17 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_community.chat_models import ChatOpenAI
 from langchain_openai import ChatOpenAI
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
+from langchain.output_parsers.structured import StructuredOutputParser
+from langchain.output_parsers import ResponseSchema
+from langchain_core.pydantic_v1 import BaseModel, Field
 import psycopg2
 from psycopg2.extras import execute_values
 import concurrent.futures
 import yaml
 import json
 from tqdm import tqdm
+from openai import AzureOpenAI
+
 
 # Set up logger
 logger = logging.getLogger(__name__)
@@ -151,53 +154,83 @@ class woocomerce_ext(API):
         logger.info("Data inserted to database")
     # creating variations for product description
     def generate_variation_text(self):
-        OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-        MODEL_NAME = os.getenv("MODEL_NAME")
+        # Load Azure OpenAI credentials from .env
+        API_KEY = os.getenv("API_KEY")
+        API_VERSION = os.getenv("API_VERSION")
+        AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT")
+        MODEL_NAME = "gpt-4o-mini"
         SLEEP_TIME = 5
         MAX_WORKERS = 3  # Adjusted for your LLM rate limits
         with open("config.yaml", "r", encoding='utf-8') as f:
             config = yaml.safe_load(f)
             num_of_var = config["inputParameter"]["num_of_variation"]
-        
-        llm = ChatOpenAI(
-            model_name=MODEL_NAME,
-            openai_api_base="https://openrouter.ai/api/v1",
-            openai_api_key=OPENROUTER_API_KEY,
+
+        client = AzureOpenAI(
+            api_key=API_KEY,
+            api_version=API_VERSION,
+            azure_endpoint=AZURE_ENDPOINT
         )
-        prompt = PromptTemplate.from_template(
-            """این توضیحات محصول است:
+        class VariationsSchema(BaseModel):
+            variations: list[str] = Field(..., description="A list of short, complete product description variations.")
+
+        # Define the response schema for variations
+        variations_schema = ResponseSchema(name="variations", description="A list of short, complete product description variations.")
+        output_parser = StructuredOutputParser(response_schemas=[variations_schema])
+
+        # Update the prompt to instruct the model to return a JSON list of variations
+        prompt_template = '''این توضیحات محصول است:
                         "{description}"
-                            لطفا {n} نسخه متفاوت و متقاعدکننده از این متن را برای فروشگاه آنلاین بنویسید. لحن باید دوستانه و متقاعدکننده باشد."""
-        )
-        chain = prompt | llm | StrOutputParser()
+                        لطفا {n} نسخه متفاوت و کوتاه اما کامل از این متن را برای فروشگاه آنلاین بنویسید. هر نسخه باید مختصر باشد اما تمام اطلاعات مهم محصول را در بر بگیرد. لحن باید دوستانه و متقاعدکننده باشد. خروجی را فقط به صورت یک شیء JSON با کلید "variations" که مقدار آن یک لیست از متن‌ها است برگردان.
+                        مثال خروجی:
+                        {{"variations": ["متن ۱", "متن ۲", ...]}}
+                        '''
 
         def generate_variations_for_product(product):
-            
             product_id, description = product
             try:
-                variations = chain.invoke({"description": description, "n": num_of_var})
-                logger.info(f"Generated variations for description: {description[:30]}...")
-                time.sleep(SLEEP_TIME)  # Sleep 5 seconds between LLM calls
-                return (variations, product_id)
+                prompt = prompt_template.format(description=description, n=num_of_var)
+                response = client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=1024,
+                    temperature=0.7,
+                )
+                raw_output = response.choices[0].message.content
+                parsed = output_parser.parse(raw_output)
+                variations = parsed["variations"]
+                time.sleep(SLEEP_TIME)
+                return (product_id, variations)
             except Exception as e:
                 logger.error(f"Error for product {product_id}: {str(e)}")
-                return (None, product_id)
+                return (product_id, [])
 
         # Fetch all products first
         with self._get_conn() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT id, description FROM products")
+            cursor.execute("SELECT id, meta_data FROM products")
             products = cursor.fetchall()
             cursor.close()
+
+        # Prepare (id, description) tuples from meta_data
+        product_tuples = []
+        for prod_id, meta_data in products:
+            try:
+                meta = meta_data if isinstance(meta_data, dict) else json.loads(meta_data)
+                description = meta.get('description', '')
+                if description:
+                    product_tuples.append((prod_id, description))
+            except Exception as e:
+                logger.error(f"Error parsing meta_data for product {prod_id}: {str(e)}")
 
         # Parallelize LLM calls
         updates = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_to_product = {executor.submit(generate_variations_for_product, product): product for product in products}
-            for future in concurrent.futures.as_completed(future_to_product):
-                variations, product_id = future.result()
-                if variations is not None:
-                    updates.append((variations, product_id))
+            future_to_product = {executor.submit(generate_variations_for_product, product): product for product in product_tuples}
+            for future in tqdm(concurrent.futures.as_completed(future_to_product), total=len(product_tuples), desc="Generating variations"):
+                product_id, variations = future.result()
+                for variation in variations:
+                    if variation:
+                        updates.append((product_id, variation))
 
         # Do all DB updates in one connection
         with self._get_conn() as conn:
