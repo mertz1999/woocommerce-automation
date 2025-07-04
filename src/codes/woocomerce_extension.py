@@ -15,6 +15,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 import psycopg2
+from psycopg2.extras import execute_values
 import concurrent.futures
 import yaml
 
@@ -111,37 +112,54 @@ class woocomerce_ext(API):
         text = re.sub(r'\s+', ' ', text).strip()
         return text
 
+      product_rows = []
+      desc_rows = []
+      for p in self.all_products:
+          product_id = p["id"]
+          name = clean_text(p["name"])
+          description = clean_text(p["description"])
+          price = p["price"]
+          regular_price = p["regular_price"]
+          on_sale = p["on_sale"]
+          stock_quantity = p["stock_quantity"]
+          total_sale = clean_text(p["total_sale"])
+          category = clean_text(p["category"])
+          img_url = clean_text(p["image_url"])
+
+          product_rows.append((product_id, name, price, regular_price, on_sale, total_sale, stock_quantity, category, img_url))
+          desc_rows.append((product_id, description))
+
       with self._get_conn() as conn:
         cursor = conn.cursor()
-        for p in self.all_products:
-            product_id = p["id"]
-            name = clean_text(p["name"])
-            description = clean_text(p["description"])
-            price = p["price"]
-            regular_price= p["regular_price"]
-            on_sale=p["on_sale"]
-            stock_quantity=p["stock_quantity"]
-            total_sale = clean_text(p["total_sale"])
-            category=clean_text(p["category"])
-            img_url = clean_text(p["image_url"])
-
-            cursor.execute("""
-                    INSERT INTO products (id, name, price,regular_price,on_sale,total_sale,stock_quantity,
-                           category,image_url)
-                    VALUES (%s, %s, %s,%s, %s,%s, %s, %s, %s)
-                    ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name , price=EXCLUDED.price
-                           , regular_price= EXCLUDED.regular_price , on_sale= EXCLUDED.on_sale, stock_quantity=EXCLUDED.stock_quantity
-                            total_sale = EXCLUDED.total_sale, category=EXCLUDED.category, img_url = EXCLUDED.image_url
-                """, (product_id, name, price,regular_price,on_sale,total_sale,stock_quantity,
-                           category,img_url))
-
-            cursor.execute("""
-                    INSERT INTO product_descriptions (product_id,variation ,created_at)
-                    VALUES (%s, %s, %s)
-                     """, (product_id, description))
-            conn.commit()
-            cursor.close()
-           
+        # Bulk upsert for products
+        execute_values(
+            cursor,
+            """
+            INSERT INTO products (id, name, price, regular_price, on_sale, total_sale, stock_quantity, category, image_url)
+            VALUES %s
+            ON CONFLICT (id) DO UPDATE SET
+                name=EXCLUDED.name,
+                price=EXCLUDED.price,
+                regular_price=EXCLUDED.regular_price,
+                on_sale=EXCLUDED.on_sale,
+                stock_quantity=EXCLUDED.stock_quantity,
+                total_sale=EXCLUDED.total_sale,
+                category=EXCLUDED.category,
+                image_url=EXCLUDED.image_url
+            """,
+            product_rows
+        )
+        # Bulk insert for product_descriptions (ignore created_at for now)
+        execute_values(
+            cursor,
+            """
+            INSERT INTO product_descriptions (product_id, variation)
+            VALUES %s
+            """,
+            desc_rows
+        )
+        conn.commit()
+        cursor.close()
         logger.info("Data inserted to database")
     # creating variations for product description
     def generate_variation_text(self):
@@ -149,6 +167,10 @@ class woocomerce_ext(API):
         MODEL_NAME = os.getenv("MODEL_NAME")
         SLEEP_TIME = 5
         MAX_WORKERS = 3  # Adjusted for your LLM rate limits
+        with open("config.yaml", "r", encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+            num_of_var = config["inputParameter"]["num_of_variation"]
+        
         llm = ChatOpenAI(
             model_name=MODEL_NAME,
             openai_api_base="https://openrouter.ai/api/v1",
@@ -162,10 +184,7 @@ class woocomerce_ext(API):
         chain = prompt | llm | StrOutputParser()
 
         def generate_variations_for_product(product):
-            with open("config.yaml", "r", encoding='utf-8') as f:
-             config = yaml.safe_load(f)
-
-            num_of_var = config["inputParameter"]["num_of_variation"]
+            
             product_id, description = product
             try:
                 variations = chain.invoke({"description": description, "n": num_of_var})
@@ -220,23 +239,23 @@ class woocomerce_ext(API):
 
         # store embeding in database
         def save_embedding_to_db(results):
-            
-            conn =self._get_conn()
+            conn = self._get_conn()
             cursor = conn.cursor()
-        
-            for  var_id , embedding in results:
-             if embedding is not None:
-            
-                cursor.execute(
-                    "INSERT INTO product_embeddings (variation_id , embedding) VALUES (%s , %s)" ,
-                    (var_id,embedding)
-                    )
+            # Filter out None embeddings
+            valid_results = [(var_id, embedding) for var_id, embedding in results if embedding is not None]
+            if valid_results:
+                execute_values(
+                    cursor,
+                    """
+                    INSERT INTO product_embeddings (variation_id, embedding)
+                    VALUES %s
+                    """,
+                    valid_results
+                )
                 conn.commit()
-                logger.info("a batch saved to db")
-                
-             else:
-                 conn.close()
-                 logger.info("saving is finished")
+                logger.info("A batch of embeddings saved to db")
+            cursor.close()
+            conn.close()
 
         #embeding process for one batch
         def embed_batch(records):
