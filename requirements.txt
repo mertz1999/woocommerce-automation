@@ -1,0 +1,13 @@
+# Required packages for woocommerce-automation
+openai
+langchain
+langchain-core
+langchain-community
+langchain-openai
+psycopg2
+psycopg2-binary
+python-dotenv
+numpy
+requests
+tqdm
+pyyaml 
