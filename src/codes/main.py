@@ -6,6 +6,7 @@ from search import search_products_by_text
 from woocommerce import API
 from dotenv import load_dotenv
 import os
+from variation import generate_variation_text
 
 def main():
     # Load environment variables
@@ -15,19 +16,21 @@ def main():
     create_tables()
 
     # Setup WooCommerce API (credentials from env)
-    # api = API(
-    #     url=os.getenv("WC_URL"),
-    #     consumer_key=os.getenv("WC_KEY"),
-    #     consumer_secret=os.getenv("WC_SECRET"),
-    #     version="wc/v3",
-    #     wp_api=True
-    # )
+    api = API(
+        url=os.getenv("WC_URL"),
+        consumer_key=os.getenv("WC_KEY"),
+        consumer_secret=os.getenv("WC_SECRET"),
+        version="wc/v3",
+        wp_api=True
+    )
 
     # Fetch and insert products
-    # products = fetch_site_data(api)
-    # put_db_products(json_path='product.json')
+    products = fetch_site_data(api)
+    put_db_products(json_path='product.json')
 
-    
+    # Generate variations
+    generate_variation_text()
+
     # Compute embeddings
     compute_embedding(batch_size=5)
 
