@@ -85,7 +85,7 @@ class woocomerce_ext(API):
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS product_embeddings (
                     id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-                    variation_id INT NOT NULL REFERENCES product_descriptions(id),
+                    variation_id INT NOT NULL REFERENCES product_descriptions(id) UNIQUE,
                     embedding vector(256),
                     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -246,14 +246,26 @@ class woocomerce_ext(API):
 
     #computing embeding for description and variations
     def compute_embedding(self, batch_size):
-        EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY")
-        MODEL_NAME = os.getenv("EMBEDDING_MODEL")
-        EMBBEDDING_URL = os.getenv("EMBEDDING_URL")
+        # Use Azure OpenAI credentials and embedding model
+        API_KEY = os.getenv("API_KEY")
+        API_VERSION = os.getenv("API_VERSION")
+        AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT")
+        EMBEDDING_MODEL = "text-embedding-3-large"
+        DIMENSIONS = 256
+        client = AzureOpenAI(
+            api_key=API_KEY,
+            api_version=API_VERSION,
+            azure_endpoint=AZURE_ENDPOINT
+        )
 
         def fetch_batch_from_db(batch_size):
            conn =self._get_conn()
            cursor = conn.cursor()
-           cursor.execute("SELECT id, variation FROM product_descriptions LIMIT %s", (batch_size,))
+           cursor.execute("""
+               SELECT id, variation FROM product_descriptions
+               WHERE id NOT IN (SELECT variation_id FROM product_embeddings)
+               LIMIT %s
+           """, (batch_size,))
            rows = cursor.fetchall()
            conn.close()
            return rows
@@ -270,6 +282,7 @@ class woocomerce_ext(API):
                     """
                     INSERT INTO product_embeddings (variation_id, embedding)
                     VALUES %s
+                    ON CONFLICT (variation_id) DO NOTHING
                     """,
                     valid_results
                 )
@@ -282,31 +295,21 @@ class woocomerce_ext(API):
         def embed_batch(records):
             texts= []
             var_ids=[]
+            MAX_CHARS = 10000  # Safe limit for text-embedding-3-large (well below 8192 tokens)
             for id, text in records:
+                # Truncate text if too long
+                if len(text) > MAX_CHARS:
+                    logger.warning(f"Variation id {id} text too long ({len(text)} chars), truncating to {MAX_CHARS} chars.")
+                    text = text[:MAX_CHARS]
                 texts.append(text)
                 var_ids.append(id)
-            headers = {
-                "api-key": EMBEDDING_API_KEY,
-                "Content-Type": "application/json"
-                 }
-
-            payload = {
-                "input": texts,
-                "dimensions": 256
-                 }
-   
-            url = EMBBEDDING_URL
-   
-            response = requests.post(url, headers=headers, json=payload)
-            if response.status_code == 200:
-              data = response.json()
-              embeddings = [item['embedding'] for item in data['data']]
-              return list(var_ids, embeddings) 
-        
-            else:
-                 raise Exception(f"Error: {response.status_code} - {response.text}")
-            
-    
+            response = client.embeddings.create(
+                model=EMBEDDING_MODEL,
+                input=texts,
+                dimensions=DIMENSIONS
+            )
+            embeddings = [item.embedding for item in response.data]
+            return list(zip(var_ids, embeddings))
 
         # run embeding for all batches
         batch_num = 1
@@ -324,55 +327,50 @@ class woocomerce_ext(API):
              batch_num += 1
              time.sleep(1)  # interupt for avoiding overloading
     
-     
-    def search_products_by_text(query_text, top_k=5):
-     EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY")
-    
-     EMBBEDDING_URL = os.getenv("EMBEDDING_URL")
-     
-     def get_query_embedding(text):
-        headers = {
-           "api-key":  EMBEDDING_API_KEY,
-           "Content-Type": "application/json"
-        }
-        payload = {
-           "input": [text],
-           "dimensions": 256
-         }
-        url =  EMBBEDDING_URL
-        response = requests.post(url, headers=headers, json=payload)
-        if response.status_code == 200:
-          data = response.json()
-          return data['data'][0]['embedding']
-        else:
-          raise Exception(f"Embedding API error: {response.status_code} - {response.text}")
-
-     embedding = get_query_embedding(query_text)
-     conn =  psycopg2.connect(
-            host=os.getenv("DB_HOST")   ,     
-            port= os.getenv("DB_PORT")  ,   
-            database= os.getenv("DB_NAME") ,   
-            user=os.getenv("DB_USER")     ,   
-            password= os.getenv("DB_PASSWORD")  
+    def search_products_by_text(self, query_text, top_k=10):
+        # Use Azure OpenAI for embedding
+        API_KEY = os.getenv("API_KEY")
+        API_VERSION = os.getenv("API_VERSION")
+        AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT")
+        EMBEDDING_MODEL = "text-embedding-3-large"
+        DIMENSIONS = 256
+        client = AzureOpenAI(
+            api_key=API_KEY,
+            api_version=API_VERSION,
+            azure_endpoint=AZURE_ENDPOINT
         )
-     cursor = conn.cursor()
-     sql = """
-        SELECT p.id, p.name, p.price, p.category, pd.variation,
-               1 - (pe.embedding <#> %s::vector) AS similarity
-        FROM product_embeddings pe
-        JOIN product_descriptions pd ON pe.variation_id = pd.id
-        JOIN products p ON pd.product_id = p.id
-        ORDER BY pe.embedding <#> %s::vector
-        LIMIT %s;
-     """
-
-     # pgvector wants the embedding as a string like: '[0.1, 0.2, ...]'
-     emb_str = "[" + ", ".join(map(str, embedding)) + "]"
-     cursor.execute(sql, (emb_str, emb_str, top_k))
-     results = cursor.fetchall()
-
-     conn.close()
-     return results
+        # Get embedding for the query
+        response = client.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=[query_text],
+            dimensions=DIMENSIONS
+        )
+        embedding = response.data[0].embedding
+        # Format embedding for SQL
+        emb_str = "[" + ", ".join(map(str, embedding)) + "]"
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        sql = """
+            SELECT p.name, p.price, p.id as product_id, pd.id as variation_id,
+                   (pe.embedding <=> %s::vector) AS distance
+            FROM product_embeddings pe
+            JOIN product_descriptions pd ON pe.variation_id = pd.id
+            JOIN products p ON pd.product_id = p.id
+            ORDER BY distance ASC
+            LIMIT 30;
+        """
+        cursor.execute(sql, (emb_str,))
+        results = cursor.fetchall()
+        conn.close()
+        # Keep only the best (smallest distance) variation for each product_id
+        best_by_product = {}
+        for row in results:
+            name, price, product_id, variation_id, distance = row
+            if product_id not in best_by_product or distance < best_by_product[product_id][4]:
+                best_by_product[product_id] = row
+        # Sort by distance and take top_k
+        final_results = sorted(best_by_product.values(), key=lambda x: x[4])[:top_k]
+        return [(r[0], r[1], r[2], r[3], r[4]) for r in final_results]
 
                 
 # Example usage
@@ -380,7 +378,15 @@ if __name__ == "__main__":
     processor = woocomerce_ext()
     # processor.fetch_site_data()
     # processor.put_db_products("./product.json")
-    processor.generate_variation_text()
+    # processor.generate_variation_text()
     # processor.compute_embedding(5) # 5 is the size of batch
-    # processor.search_products_by_text("فیلم برداری حرفه ای")
+    results = processor.search_products_by_text("فیلم برداری حرفه ای")
+    # Print results
+    for r in results:
+        print(r)
+    # Write results to output.json
+    with open("output.json", "w", encoding="utf-8") as f:
+        json.dump([
+            {"name": r[0], "price": r[1], "product_id": r[2], "variation_id": r[3], "distance": r[4]} for r in results
+        ], f, ensure_ascii=False, indent=2)
       
