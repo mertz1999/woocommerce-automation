@@ -6,14 +6,17 @@ from search import search_products_by_text
 from woocommerce import API
 from dotenv import load_dotenv
 import os
-from variation import generate_variation_text
+#from variation import generate_variation_text
+import variationv2
+import searchByFilterv2
+import converting
 
 def main():
     # Load environment variables
     load_dotenv()
 
     # Initialize DB
-    create_tables()
+    #create_tables()
 
     # Setup WooCommerce API (credentials from env)
     api = API(
@@ -25,19 +28,22 @@ def main():
     )
 
     # Fetch and insert products
-    products = fetch_site_data(api)
-    put_db_products(json_path='product.json')
+    #products = fetch_site_data(api)
+    #put_db_products(json_path='product.json')
+
+    converting.sql_functions()
+    converting.extract_normal_filters({"price": "price", "course-time": "time"})
 
     # Generate variations
-    generate_variation_text()
+    #variationv2.generate_variation_text()
 
     # Compute embeddings
-    compute_embedding(batch_size=5)
+    #compute_embedding(batch_size=5)
 
     # Search
-    results = search_products_by_text("فیلم برداری حرفه ای")
+    results = searchByFilterv2.searchByFilter("آموزش فتوشاپ 4 ساعت", course-time)
     for r in results:
-        print(r)
+       print(r)
     with open("output.json", "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
